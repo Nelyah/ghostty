@@ -2691,9 +2691,12 @@ pub fn keyCallback(
             self.mouse.mods,
         );
         const modifier_forwarded_to_app = self.mouseModifierCapture(false);
-        if (self.io.terminal.flags.mouse_event == .none or
-            (capture_modifier_pressed and !modifier_forwarded_to_app))
-        {
+        if (shouldDetectLinks(
+            self.io.terminal.flags.mouse_event,
+            capture_modifier_pressed,
+            modifier_forwarded_to_app,
+            self.mouse.mods,
+        )) {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
             self.renderer_state.mutex.lock();
@@ -3916,6 +3919,31 @@ fn mouseModsWithCaptureModifier(
     return final;
 }
 
+/// Returns true if link detection should be active given the current
+/// mouse reporting state, capture modifier state, and held modifiers.
+/// This is the gate condition used by both cursorPosCallback and
+/// keyCallback to decide whether to refresh link highlights.
+fn shouldDetectLinks(
+    mouse_event: terminal.Terminal.MouseEvents,
+    capture_modifier_pressed: bool,
+    modifier_forwarded_to_app: bool,
+    mods: input.Mods,
+) bool {
+    return mouse_event == .none or
+        (capture_modifier_pressed and !modifier_forwarded_to_app) or
+        mods.ctrlOrSuper();
+}
+
+/// Returns true if a mouse press event should be suppressed from
+/// reporting to the application because the user is clicking a link
+/// with ctrl/super held.
+fn shouldSuppressMousePressForLink(
+    over_link: bool,
+    mods: input.Mods,
+) bool {
+    return over_link and mods.ctrlOrSuper();
+}
+
 fn rightClickBypassesMouseReporting(
     right_click_action: configpkg.RightClickAction,
     button: input.MouseButton,
@@ -4075,6 +4103,8 @@ pub fn mouseButtonCallback(
                 self.mouse.right_click_bypass_pending_release = right_click_bypass;
             }
             if (right_click_bypass) break :report;
+
+            if (shouldSuppressMousePressForLink(self.mouse.over_link, mods)) break :report;
 
             // If our capture modifier is pressed and we aren't allowed to
             // capture it, then we do not do a mouse report.
@@ -4815,8 +4845,12 @@ pub fn cursorPosCallback(
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
-            (capture_modifier_pressed and !modifier_forwarded_to_app)))
+        shouldDetectLinks(
+            self.io.terminal.flags.mouse_event,
+            capture_modifier_pressed,
+            modifier_forwarded_to_app,
+            self.mouse.mods,
+        ))
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
@@ -6970,4 +7004,59 @@ test "Surface: configured mouse capture modifier helpers" {
     );
     try testing.expect(alt_super_override_mods.alt);
     try testing.expect(SurfaceMouse.isRectangleSelectState(.shift, alt_super_override_mods));
+}
+
+test "Surface: link detection gate with ctrlOrSuper" {
+    const testing = std.testing;
+    const ctrl_or_super_mods = input.ctrlOrSuper(.{});
+
+    // No mouse reporting: always detect links regardless of modifiers
+    try testing.expect(shouldDetectLinks(.none, false, false, .{}));
+    try testing.expect(shouldDetectLinks(.none, false, false, ctrl_or_super_mods));
+    try testing.expect(shouldDetectLinks(.none, true, false, .{ .shift = true }));
+
+    // Mouse reporting on, no special modifiers: no link detection
+    try testing.expect(!shouldDetectLinks(.normal, false, false, .{}));
+
+    // Mouse reporting on, capture modifier pressed and not forwarded: detect
+    try testing.expect(shouldDetectLinks(.normal, true, false, .{ .shift = true }));
+
+    // Mouse reporting on, capture modifier pressed but forwarded to app: no detect
+    try testing.expect(!shouldDetectLinks(.normal, true, true, .{ .shift = true }));
+
+    // Mouse reporting on, ctrlOrSuper held (no capture modifier): detect
+    // This is the key behavior added by mouse-capture-modifier bypass.
+    try testing.expect(shouldDetectLinks(.normal, false, false, ctrl_or_super_mods));
+
+    // Mouse reporting on, ctrlOrSuper held even when capture modifier is forwarded: detect
+    var ctrl_or_super_shift_mods = ctrl_or_super_mods;
+    ctrl_or_super_shift_mods.shift = true;
+    try testing.expect(shouldDetectLinks(.normal, true, true, ctrl_or_super_shift_mods));
+
+    // All mouse event modes should work the same
+    try testing.expect(shouldDetectLinks(.button, false, false, ctrl_or_super_mods));
+    try testing.expect(shouldDetectLinks(.any, false, false, ctrl_or_super_mods));
+    try testing.expect(!shouldDetectLinks(.button, false, false, .{}));
+    try testing.expect(!shouldDetectLinks(.any, false, false, .{}));
+
+    // Only shift or alt alone is not enough to bypass
+    try testing.expect(!shouldDetectLinks(.normal, false, false, .{ .shift = true }));
+    try testing.expect(!shouldDetectLinks(.normal, false, false, .{ .alt = true }));
+}
+
+test "Surface: suppress mouse press for link click" {
+    const testing = std.testing;
+    const ctrl_or_super_mods = input.ctrlOrSuper(.{});
+
+    // Over a link with ctrlOrSuper held: suppress
+    try testing.expect(shouldSuppressMousePressForLink(true, ctrl_or_super_mods));
+
+    // Over a link without ctrlOrSuper: don't suppress
+    try testing.expect(!shouldSuppressMousePressForLink(true, .{}));
+    try testing.expect(!shouldSuppressMousePressForLink(true, .{ .shift = true }));
+    try testing.expect(!shouldSuppressMousePressForLink(true, .{ .alt = true }));
+
+    // Not over a link: never suppress, even with ctrlOrSuper
+    try testing.expect(!shouldSuppressMousePressForLink(false, ctrl_or_super_mods));
+    try testing.expect(!shouldSuppressMousePressForLink(false, .{}));
 }
