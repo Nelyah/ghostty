@@ -7,6 +7,7 @@ const SurfaceMouse = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
+const configpkg = @import("config.zig");
 const input = @import("input.zig");
 const terminal = @import("terminal/main.zig");
 const MouseShape = @import("terminal/mouse_shape.zig").MouseShape;
@@ -30,6 +31,9 @@ over_link: bool,
 
 /// True if the mouse pointer is currently hidden.
 hidden: bool,
+
+/// The configured mouse capture modifier.
+mouse_capture_modifier: configpkg.MouseCaptureModifier,
 
 /// Translates key state to mouse shape (cursor) state, based on a state
 /// machine.
@@ -80,11 +84,11 @@ pub fn keyToMouseShape(self: SurfaceMouse) ?MouseShape {
     // mouse over a link", etc.
     switch (current_shape_state) {
         .default => {
-            if (isMouseModeOverrideState(self.mods) and isRectangleSelectState(self.mods)) {
+            if (isMouseModeOverrideState(self.mouse_capture_modifier, self.mods) and isRectangleSelectState(self.mouse_capture_modifier, self.mods)) {
                 // Crosshair (rectangle select), only set if we are also
                 // overriding (e.g. shift+ctrl+alt)
                 return .crosshair;
-            } else if (isMouseModeOverrideState(self.mods)) {
+            } else if (isMouseModeOverrideState(self.mouse_capture_modifier, self.mods)) {
                 // Normal override state
                 return .text;
             } else {
@@ -93,7 +97,7 @@ pub fn keyToMouseShape(self: SurfaceMouse) ?MouseShape {
         },
 
         .text => {
-            if (isRectangleSelectState(self.mods)) {
+            if (isRectangleSelectState(self.mouse_capture_modifier, self.mods)) {
                 // Crosshair (rectangle select)
                 return .crosshair;
             } else {
@@ -112,17 +116,23 @@ fn eligibleMouseShapeKeyEvent(physical_key: input.Key) bool {
         physical_key.leftOrRightAlt();
 }
 
-fn isMouseModeOverrideState(mods: input.Mods) bool {
-    return mods.shift;
+fn isMouseModeOverrideState(modifier: configpkg.MouseCaptureModifier, mods: input.Mods) bool {
+    return switch (modifier) {
+        .shift => mods.shift,
+        .alt => mods.alt,
+    };
 }
 
 /// Returns true if our modifiers put us in a state where dragging
 /// should cause a rectangle select.
-pub fn isRectangleSelectState(mods: input.Mods) bool {
-    return if (comptime builtin.target.os.tag.isDarwin())
-        mods.alt
-    else
-        mods.ctrlOrSuper() and mods.alt;
+pub fn isRectangleSelectState(modifier: configpkg.MouseCaptureModifier, mods: input.Mods) bool {
+    return switch (modifier) {
+        .shift => if (comptime builtin.target.os.tag.isDarwin())
+            mods.alt
+        else
+            mods.ctrlOrSuper() and mods.alt,
+        .alt => mods.ctrlOrSuper() and mods.alt,
+    };
 }
 
 test "keyToMouseShape" {
@@ -137,6 +147,7 @@ test "keyToMouseShape" {
             .mods = .{},
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const got = m.keyToMouseShape();
@@ -153,6 +164,7 @@ test "keyToMouseShape" {
             .mods = .{},
             .over_link = true,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const got = m.keyToMouseShape();
@@ -168,6 +180,7 @@ test "keyToMouseShape" {
             .mods = .{},
             .over_link = true,
             .hidden = true,
+            .mouse_capture_modifier = .shift,
         };
 
         const got = m.keyToMouseShape();
@@ -183,6 +196,7 @@ test "keyToMouseShape" {
             .mods = .{},
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const want: MouseShape = .default;
@@ -199,6 +213,7 @@ test "keyToMouseShape" {
             .mods = .{ .ctrl = true, .super = true, .alt = true, .shift = true },
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const want: MouseShape = .crosshair;
@@ -215,6 +230,7 @@ test "keyToMouseShape" {
             .mods = .{ .shift = true },
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const want: MouseShape = .text;
@@ -231,6 +247,7 @@ test "keyToMouseShape" {
             .mods = .{ .shift = true },
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const want: MouseShape = .text;
@@ -247,6 +264,7 @@ test "keyToMouseShape" {
             .mods = .{},
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const want: MouseShape = .default;
@@ -263,6 +281,7 @@ test "keyToMouseShape" {
             .mods = .{ .ctrl = true, .super = true, .alt = true, .shift = true },
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const want: MouseShape = .crosshair;
@@ -279,6 +298,7 @@ test "keyToMouseShape" {
             .mods = .{},
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const want: MouseShape = .default;
@@ -295,6 +315,7 @@ test "keyToMouseShape" {
             .mods = .{},
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const want: MouseShape = .text;
@@ -311,6 +332,7 @@ test "keyToMouseShape" {
             .mods = .{ .ctrl = true, .super = true, .alt = true },
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const want: MouseShape = .crosshair;
@@ -327,9 +349,83 @@ test "keyToMouseShape" {
             .mods = .{},
             .over_link = false,
             .hidden = false,
+            .mouse_capture_modifier = .shift,
         };
 
         const want: MouseShape = .text;
+        const got = m.keyToMouseShape();
+        try testing.expect(want == got);
+    }
+}
+
+test "keyToMouseShape alt capture modifier" {
+    const testing = std.testing;
+
+    {
+        // default -> text when alt pressed (mouse tracking, alt capture)
+        const m: SurfaceMouse = .{
+            .physical_key = .alt_left,
+            .mouse_event = .x10,
+            .mouse_shape = .default,
+            .mods = .{ .alt = true },
+            .over_link = false,
+            .hidden = false,
+            .mouse_capture_modifier = .alt,
+        };
+
+        const want: MouseShape = .text;
+        const got = m.keyToMouseShape();
+        try testing.expect(want == got);
+    }
+
+    {
+        // default -> default when shift pressed (mouse tracking, alt capture)
+        // shift is NOT the capture modifier here, so no override
+        const m: SurfaceMouse = .{
+            .physical_key = .shift_left,
+            .mouse_event = .x10,
+            .mouse_shape = .default,
+            .mods = .{ .shift = true },
+            .over_link = false,
+            .hidden = false,
+            .mouse_capture_modifier = .alt,
+        };
+
+        const want: MouseShape = .default;
+        const got = m.keyToMouseShape();
+        try testing.expect(want == got);
+    }
+
+    {
+        // default -> crosshair (mouse tracking, alt capture, ctrl+alt)
+        const m: SurfaceMouse = .{
+            .physical_key = .alt_left,
+            .mouse_event = .x10,
+            .mouse_shape = .default,
+            .mods = .{ .ctrl = true, .super = true, .alt = true },
+            .over_link = false,
+            .hidden = false,
+            .mouse_capture_modifier = .alt,
+        };
+
+        const want: MouseShape = .crosshair;
+        const got = m.keyToMouseShape();
+        try testing.expect(want == got);
+    }
+
+    {
+        // text -> crosshair (no mouse tracking, alt capture, ctrl+alt)
+        const m: SurfaceMouse = .{
+            .physical_key = .alt_left,
+            .mouse_event = .none,
+            .mouse_shape = .text,
+            .mods = .{ .ctrl = true, .super = true, .alt = true },
+            .over_link = false,
+            .hidden = false,
+            .mouse_capture_modifier = .alt,
+        };
+
+        const want: MouseShape = .crosshair;
         const got = m.keyToMouseShape();
         try testing.expect(want == got);
     }
