@@ -212,6 +212,11 @@ const Mouse = struct {
     /// The last tracked mouse button state by button.
     click_state: [input.MouseButton.max]input.MouseButtonState = @splat(.release),
 
+    /// True if the right mouse button press bypassed mouse reporting and
+    /// the corresponding release should also bypass to keep button state
+    /// consistent
+    right_click_bypass_pending_release: bool = false,
+
     /// The last mods state when the last mouse button (whatever it was) was
     /// pressed or release.
     mods: input.Mods = .{},
@@ -311,6 +316,7 @@ const DerivedConfig = struct {
     mouse_hide_while_typing: bool,
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
+    mouse_capture_modifier: configpkg.MouseCaptureModifier,
     mouse_shift_capture: configpkg.MouseShiftCapture,
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
@@ -389,6 +395,7 @@ const DerivedConfig = struct {
             .mouse_hide_while_typing = config.@"mouse-hide-while-typing",
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
+            .mouse_capture_modifier = config.@"mouse-capture-modifier",
             .mouse_shift_capture = config.@"mouse-shift-capture",
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
@@ -2677,9 +2684,15 @@ pub fn keyCallback(
         // We only refresh links if
         // 1. mouse reporting is off
         // OR
-        // 2. mouse reporting is on and we are not reporting shift to the terminal
+        // 2. mouse reporting is on and we are not reporting the mouse
+        //    capture modifier to the terminal.
+        const capture_modifier_pressed = mouseCaptureModifierPressed(
+            self.config.mouse_capture_modifier,
+            self.mouse.mods,
+        );
+        const modifier_forwarded_to_app = self.mouseModifierCapture(false);
         if (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
+            (capture_modifier_pressed and !modifier_forwarded_to_app))
         {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
@@ -2693,8 +2706,9 @@ pub fn keyCallback(
                 log.warn("failed to refresh links err={}", .{err});
                 break :mouse_mods;
             };
-        } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
-            // If we have mouse reports on and we don't have shift pressed, we reset state
+        } else if (self.io.terminal.flags.mouse_event != .none and !capture_modifier_pressed) {
+            // If we have mouse reports on and our capture modifier is not
+            // pressed, we reset state.
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
@@ -2718,6 +2732,7 @@ pub fn keyCallback(
         .mods = self.mouse.mods,
         .over_link = self.mouse.over_link,
         .hidden = self.mouse.hidden,
+        .mouse_capture_modifier = self.config.mouse_capture_modifier,
     }).keyToMouseShape()) |shape| _ = try self.rt_app.performAction(
         .{ .surface = self },
         .mouse_shape,
@@ -3860,6 +3875,63 @@ pub fn mouseCaptured(self: *Surface) bool {
     return self.io.terminal.flags.mouse_event != .none;
 }
 
+fn mouseCaptureModifierPressed(
+    modifier: configpkg.MouseCaptureModifier,
+    mods: input.Mods,
+) bool {
+    return switch (modifier) {
+        .shift => mods.shift,
+        .alt => mods.alt,
+    };
+}
+
+/// Returns true if the capture modifier should be forwarded to the
+/// application rather than intercepted for local terminal behavior.
+fn mouseModifierCapture(self: *const Surface, lock: bool) bool {
+    return switch (self.config.mouse_capture_modifier) {
+        .shift => self.mouseShiftCapture(lock),
+        .alt => false,
+    };
+}
+
+fn mouseModsWithCaptureModifier(
+    modifier: configpkg.MouseCaptureModifier,
+    mouse_event: terminal.Terminal.MouseEvents,
+    modifier_forwarded: bool,
+    mods: input.Mods,
+) input.Mods {
+    if (mouse_event == .none) return mods;
+    if (!mouseCaptureModifierPressed(modifier, mods)) return mods;
+    if (modifier_forwarded) return mods;
+
+    var final = mods;
+    switch (modifier) {
+        .shift => final.shift = false,
+        .alt => {
+            // For alt-based override, alt alone should keep normal selection.
+            // Holding ctrlOrSuper+alt keeps alt so rectangle selection still works.
+            if (!mods.ctrlOrSuper()) final.alt = false;
+        },
+    }
+    return final;
+}
+
+fn rightClickBypassesMouseReporting(
+    right_click_action: configpkg.RightClickAction,
+    button: input.MouseButton,
+    action: input.MouseButtonState,
+    has_selection: bool,
+    bypass_pending_release: bool,
+) bool {
+    if (button != .right) return false;
+    if (action == .release) return bypass_pending_release;
+    if (action != .press or !has_selection) return false;
+    return switch (right_click_action) {
+        .copy, .@"copy-or-paste" => true,
+        .paste, .ignore, .@"context-menu" => false,
+    };
+}
+
 /// Called for mouse button press/release events. This will return true
 /// if the mouse event was consumed in some way (i.e. the program is capturing
 /// mouse events). If the event was not consumed, then false is returned.
@@ -3889,21 +3961,26 @@ pub fn mouseButtonCallback(
     // Update our modifiers if they changed
     self.modsChanged(mods);
 
-    // This is set to true if the terminal is allowed to capture the shift
-    // modifier. Note we can do this more efficiently probably with less
-    // locking/unlocking but clicking isn't that frequent enough to be a
-    // bottleneck.
-    const shift_capture = self.mouseShiftCapture(true);
+    // True if the capture modifier is forwarded to the application (rather
+    // than intercepted for local terminal behavior). Note we can do this
+    // more efficiently probably with less locking/unlocking but clicking
+    // isn't that frequent enough to be a bottleneck.
+    const modifier_forwarded_to_app = self.mouseModifierCapture(true);
+    const capture_modifier_pressed = mouseCaptureModifierPressed(
+        self.config.mouse_capture_modifier,
+        mods,
+    );
 
-    // Shift-click continues the previous mouse state if we have a selection.
+    // Capture-modifier-click continues the previous mouse state if we have a
+    // selection.
     // cursorPosCallback will also do a mouse report so we don't need to do any
     // of the logic below.
     if (button == .left and action == .press) {
         // We could do all the conditionals in one but I find it more
         // readable as a human to break this one up.
-        if (mods.shift and
+        if (capture_modifier_pressed and
             self.mouse.left_click_count > 0 and
-            !shift_capture)
+            !modifier_forwarded_to_app)
         extend_selection: {
             // We split this conditional out on its own because this is the
             // only one that requires a renderer mutex grab which is VERY
@@ -3987,13 +4064,25 @@ pub fn mouseButtonCallback(
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
         if (self.isMouseReporting()) report: {
-            // If we have shift-pressed and we aren't allowed to capture it,
-            // then we do not do a mouse report.
-            if (mods.shift and !shift_capture) break :report;
+            const right_click_bypass = rightClickBypassesMouseReporting(
+                self.config.right_click_action,
+                button,
+                action,
+                self.io.terminal.screens.active.selection != null,
+                self.mouse.right_click_bypass_pending_release,
+            );
+            if (button == .right and action == .press) {
+                self.mouse.right_click_bypass_pending_release = right_click_bypass;
+            }
+            if (right_click_bypass) break :report;
 
-            // In any other mouse button scenario without shift pressed we
-            // clear the selection since the underlying application can handle
-            // that in any way (i.e. "scrolling").
+            // If our capture modifier is pressed and we aren't allowed to
+            // capture it, then we do not do a mouse report.
+            if (capture_modifier_pressed and !modifier_forwarded_to_app) break :report;
+
+            // In any other mouse button scenario without our capture
+            // modifier pressed, we clear the selection since the underlying
+            // application can handle that in any way (i.e. "scrolling").
             try self.setSelection(null);
 
             // We also set the left click count to 0 so that if mouse reporting
@@ -4018,6 +4107,17 @@ pub fn mouseButtonCallback(
             // If we're doing mouse reporting, we do not support any other
             // selection or highlighting.
             return true;
+        }
+
+        // TODO: right_click_bypass_pending_release is set on press (above)
+        // and cleared here on release. This works because no early-return path
+        // between those points handles right-click, but there should probably be
+        // a better mechanism for keeping track of the state.
+        //
+        // Always clear pending right-click bypass state on release, even if
+        // mouse reporting was disabled before release was delivered.
+        if (button == .right and action == .release) {
+            self.mouse.right_click_bypass_pending_release = false;
         }
     }
 
@@ -4474,22 +4574,17 @@ fn linkAtPin(
 }
 
 /// This returns the mouse mods to consider for link highlighting or
-/// other purposes taking into account when shift is pressed for releasing
-/// the mouse from capture.
+/// other purposes taking into account when our capture modifier is pressed
+/// for releasing the mouse from capture.
 ///
 /// The renderer state mutex must be held.
 fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
-    // In any of these scenarios, whatever mods are set (even shift)
-    // are preserved.
-    if (self.io.terminal.flags.mouse_event == .none) return mods;
-    if (!mods.shift) return mods;
-    if (self.mouseShiftCapture(false)) return mods;
-
-    // We have mouse capture, shift set, and we're not allowed to capture
-    // shift, so we can clear shift.
-    var final = mods;
-    final.shift = false;
-    return final;
+    return mouseModsWithCaptureModifier(
+        self.config.mouse_capture_modifier,
+        self.io.terminal.flags.mouse_event,
+        self.mouseModifierCapture(false),
+        mods,
+    );
 }
 
 /// Attempt to invoke the action of any link that is under the
@@ -4710,12 +4805,18 @@ pub fn cursorPosCallback(
     // AND
     // 1. mouse reporting is off
     // OR
-    // 2. mouse reporting is on and we are not reporting shift to the terminal
+    // 2. mouse reporting is on and we are not reporting our capture modifier
+    //    to the terminal.
+    const capture_modifier_pressed = mouseCaptureModifierPressed(
+        self.config.mouse_capture_modifier,
+        self.mouse.mods,
+    );
+    const modifier_forwarded_to_app = self.mouseModifierCapture(false);
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
         (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+            (capture_modifier_pressed and !modifier_forwarded_to_app)))
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
@@ -4724,10 +4825,10 @@ pub fn cursorPosCallback(
 
     // Do a mouse report
     if (self.isMouseReporting()) report: {
-        // Shift overrides mouse "grabbing" in the window, taken from Kitty.
+        // Our configured modifier overrides mouse "grabbing" in the window.
         // This only applies if there is a mouse button pressed so that
         // movement reports are not affected.
-        if (self.mouse.mods.shift and !self.mouseShiftCapture(false)) {
+        if (capture_modifier_pressed and !modifier_forwarded_to_app) {
             for (self.mouse.click_state) |state| {
                 if (state != .release) break :report;
             }
@@ -4885,13 +4986,15 @@ fn dragLeftClickSingle(
     drag_pin: terminal.Pin,
     drag_x: f64,
 ) !void {
+    const selection_mods = self.mouseModsWithCapture(self.mouse.mods);
+
     // This logic is in a separate function so that it can be unit tested.
     try self.io.terminal.screens.active.select(mouseSelection(
         self.mouse.left_click_pin.?.*,
         drag_pin,
         @intFromFloat(@max(0.0, self.mouse.left_click_xpos)),
         @intFromFloat(@max(0.0, drag_x)),
-        self.mouse.mods,
+        selection_mods,
         self.size,
     ));
 }
@@ -4945,7 +5048,7 @@ fn mouseSelection(
     const click_x_frac = @min(max_x, click_x -| size.padding.left) % size.cell.width;
 
     // Whether or not this is a rectangular selection.
-    const rectangle_selection = SurfaceMouse.isRectangleSelectState(mods);
+    const rectangle_selection = SurfaceMouse.isRectangleSelectState(.shift, mods);
 
     // Whether the click pin and drag pin are equal.
     const same_pin = drag_pin.eql(click_pin);
@@ -6389,7 +6492,7 @@ fn testMouseSelection(
         .alt = rect,
     };
 
-    try std.testing.expectEqual(rect, SurfaceMouse.isRectangleSelectState(mods));
+    try std.testing.expectEqual(rect, SurfaceMouse.isRectangleSelectState(.shift, mods));
 
     const click_pin = screen.pages.pin(.{
         .viewport = .{ .x = @intFromFloat(@floor(click_x)), .y = click_y },
@@ -6458,7 +6561,7 @@ fn testMouseSelectionIsNull(
         .alt = rect,
     };
 
-    try std.testing.expectEqual(rect, SurfaceMouse.isRectangleSelectState(mods));
+    try std.testing.expectEqual(rect, SurfaceMouse.isRectangleSelectState(.shift, mods));
 
     const click_pin = screen.pages.pin(.{
         .viewport = .{ .x = @intFromFloat(@floor(click_x)), .y = click_y },
@@ -6774,4 +6877,97 @@ test "Surface: rectangle selection logic" {
         9, 2, // expected end
         true, //rectangle selection
     );
+}
+
+test "Surface: right-click copy bypasses mouse reporting with selection" {
+    const testing = std.testing;
+
+    try testing.expect(rightClickBypassesMouseReporting(
+        .copy,
+        .right,
+        .press,
+        true,
+        false,
+    ));
+    try testing.expect(rightClickBypassesMouseReporting(
+        .@"copy-or-paste",
+        .right,
+        .press,
+        true,
+        false,
+    ));
+
+    try testing.expect(!rightClickBypassesMouseReporting(
+        .copy,
+        .right,
+        .press,
+        false,
+        false,
+    ));
+    try testing.expect(!rightClickBypassesMouseReporting(
+        .paste,
+        .right,
+        .press,
+        true,
+        false,
+    ));
+    try testing.expect(!rightClickBypassesMouseReporting(
+        .copy,
+        .left,
+        .press,
+        true,
+        false,
+    ));
+    try testing.expect(!rightClickBypassesMouseReporting(
+        .copy,
+        .right,
+        .release,
+        true,
+        false,
+    ));
+    try testing.expect(rightClickBypassesMouseReporting(
+        .copy,
+        .right,
+        .release,
+        false,
+        true,
+    ));
+}
+
+test "Surface: configured mouse capture modifier helpers" {
+    const testing = std.testing;
+
+    try testing.expect(mouseCaptureModifierPressed(.shift, .{ .shift = true }));
+    try testing.expect(!mouseCaptureModifierPressed(.shift, .{ .alt = true }));
+    try testing.expect(mouseCaptureModifierPressed(.alt, .{ .alt = true }));
+    try testing.expect(!mouseCaptureModifierPressed(.alt, .{ .shift = true }));
+
+    const alt_override_mods = mouseModsWithCaptureModifier(
+        .alt,
+        .normal,
+        false,
+        .{ .alt = true },
+    );
+    try testing.expect(!alt_override_mods.alt);
+    try testing.expect(!SurfaceMouse.isRectangleSelectState(.shift, alt_override_mods));
+
+    // alt+shift without ctrlOrSuper: alt should be stripped (no rectangle select)
+    const alt_shift_override_mods = mouseModsWithCaptureModifier(
+        .alt,
+        .normal,
+        false,
+        .{ .alt = true, .shift = true },
+    );
+    try testing.expect(!alt_shift_override_mods.alt);
+    try testing.expect(!SurfaceMouse.isRectangleSelectState(.shift, alt_shift_override_mods));
+
+    // alt+ctrlOrSuper: alt should be preserved (rectangle select)
+    const alt_super_override_mods = mouseModsWithCaptureModifier(
+        .alt,
+        .normal,
+        false,
+        .{ .alt = true, .super = true },
+    );
+    try testing.expect(alt_super_override_mods.alt);
+    try testing.expect(SurfaceMouse.isRectangleSelectState(.shift, alt_super_override_mods));
 }

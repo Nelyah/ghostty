@@ -937,6 +937,8 @@ palette: Palette = .{},
 /// Determines whether running programs can detect the shift key pressed with a
 /// mouse click. Typically, the shift key is used to extend mouse selection.
 ///
+/// This only applies when `mouse-capture-modifier = shift`.
+///
 /// The default value of `false` means that the shift key is not sent with
 /// the mouse protocol and will extend the selection. This value can be
 /// conditionally overridden by the running program with the `XTSHIFTESCAPE`
@@ -960,6 +962,17 @@ palette: Palette = .{},
 ///   * `always`
 ///   * `never`
 @"mouse-shift-capture": MouseShiftCapture = .false,
+
+/// The modifier key that can be used to bypass mouse reporting capture and use
+/// local terminal mouse behavior such as selection.
+///
+/// Valid values are:
+///
+///   * `shift`
+///   * `alt`
+///
+/// The default is `shift`.
+@"mouse-capture-modifier": MouseCaptureModifier = .shift,
 
 /// Enable or disable mouse reporting. When set to `false`, mouse events will
 /// not be reported to terminal applications even if they request it. This
@@ -8879,6 +8892,12 @@ pub const MouseShiftCapture = enum {
     true,
     always,
     never,
+};
+
+/// See mouse-capture-modifier
+pub const MouseCaptureModifier = enum {
+    shift,
+    alt,
 };
 
 /// See mouse-scroll-multiplier
