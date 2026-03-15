@@ -3960,6 +3960,22 @@ fn rightClickBypassesMouseReporting(
     };
 }
 
+fn leftClickCaptureBypassesMouseReporting(
+    button: input.MouseButton,
+    action: input.MouseButtonState,
+    capture_modifier_pressed: bool,
+    modifier_forwarded_to_app: bool,
+    left_click_count: u8,
+) bool {
+    if (button != .left) return false;
+    // On release, bypass if the press was handled locally (count > 0).
+    // When mouse reporting handles a press, it zeros left_click_count,
+    // so a non-zero count means the press bypassed reporting.
+    if (action == .release) return left_click_count > 0;
+    if (action != .press) return false;
+    return capture_modifier_pressed and !modifier_forwarded_to_app;
+}
+
 /// Called for mouse button press/release events. This will return true
 /// if the mouse event was consumed in some way (i.e. the program is capturing
 /// mouse events). If the event was not consumed, then false is returned.
@@ -4107,7 +4123,16 @@ pub fn mouseButtonCallback(
             if (shouldSuppressMousePressForLink(self.mouse.over_link, mods)) break :report;
 
             // If our capture modifier is pressed and we aren't allowed to
-            // capture it, then we do not do a mouse report.
+            // capture it, then we do not do a mouse report. On left release,
+            // also bypass if the press was handled locally (left_click_count > 0)
+            // so releasing the modifier before the button preserves the selection.
+            if (leftClickCaptureBypassesMouseReporting(
+                button,
+                action,
+                capture_modifier_pressed,
+                modifier_forwarded_to_app,
+                self.mouse.left_click_count,
+            )) break :report;
             if (capture_modifier_pressed and !modifier_forwarded_to_app) break :report;
 
             // In any other mouse button scenario without our capture
@@ -4861,8 +4886,12 @@ pub fn cursorPosCallback(
     if (self.isMouseReporting()) report: {
         // Our configured modifier overrides mouse "grabbing" in the window.
         // This only applies if there is a mouse button pressed so that
-        // movement reports are not affected.
-        if (capture_modifier_pressed and !modifier_forwarded_to_app) {
+        // movement reports are not affected. We also bypass if there is
+        // an active local click (left_click_count > 0) so that releasing
+        // the capture modifier mid-drag doesn't interrupt selection.
+        if ((capture_modifier_pressed and !modifier_forwarded_to_app) or
+            self.mouse.left_click_count > 0)
+        {
             for (self.mouse.click_state) |state| {
                 if (state != .release) break :report;
             }
@@ -6966,6 +6995,32 @@ test "Surface: right-click copy bypasses mouse reporting with selection" {
         false,
         true,
     ));
+}
+
+test "Surface: left click capture modifier bypass pending release" {
+    const testing = std.testing;
+
+    // Left press with capture modifier -> bypass
+    try testing.expect(leftClickCaptureBypassesMouseReporting(.left, .press, true, false, 0));
+
+    // Left press without capture modifier -> no bypass
+    try testing.expect(!leftClickCaptureBypassesMouseReporting(.left, .press, false, false, 0));
+
+    // Left press with capture modifier forwarded to app -> no bypass
+    try testing.expect(!leftClickCaptureBypassesMouseReporting(.left, .press, true, true, 0));
+
+    // Left release with active local click (count > 0) -> bypass.
+    // This is the bug fix: left_click_count > 0 means the press was handled
+    // locally, so the release should also bypass mouse reporting regardless
+    // of whether the capture modifier is still held.
+    try testing.expect(leftClickCaptureBypassesMouseReporting(.left, .release, false, false, 1));
+
+    // Left release without active local click -> no bypass
+    try testing.expect(!leftClickCaptureBypassesMouseReporting(.left, .release, false, false, 0));
+
+    // Right button is not affected
+    try testing.expect(!leftClickCaptureBypassesMouseReporting(.right, .press, true, false, 0));
+    try testing.expect(!leftClickCaptureBypassesMouseReporting(.right, .release, false, false, 1));
 }
 
 test "Surface: configured mouse capture modifier helpers" {
