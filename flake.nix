@@ -69,6 +69,22 @@
       revision = self.shortRev or self.dirtyShortRev or "dirty";
     };
   in {
+    lib.mkMacOSActivationScript = {
+      pkgs,
+      username,
+      installPath ? "/Applications/Ghostty.app",
+    }: let
+      buildDir = "/Users/${username}/.cache/ghostty-build";
+    in ''
+        ${pkgs.coreutils}/bin/echo "Building Ghostty from custom fork..."
+        /usr/bin/sudo -u ${username} ${pkgs.coreutils}/bin/mkdir -p "${buildDir}"
+        /usr/bin/sudo -u ${username} ${pkgs.rsync}/bin/rsync --archive --delete --exclude='.zig-cache' --exclude='zig-out' "${self}/" "${buildDir}/"
+        /usr/bin/sudo -u ${username} HOME="/Users/${username}" ${pkgs.nix}/bin/nix develop "${self}" --command bash -c "cd ${buildDir} && zig build -Doptimize=ReleaseFast -Demit-macos-app && cd macos && ./build.nu --configuration Release" 2>&1 || { echo "Ghostty build failed"; exit 1; }
+        /usr/bin/codesign --force --deep --sign - "${buildDir}/zig-out/Ghostty.app"
+        ${pkgs.rsync}/bin/rsync --archive --delete "${buildDir}/zig-out/Ghostty.app/" "${installPath}/"
+        echo "Ghostty installed and signed."
+    '';
+
     devShells = forAllPlatforms (pkgs: {
       default = pkgs.callPackage ./nix/devShell.nix {
         zig = zig.packages.${pkgs.stdenv.hostPlatform.system}."0.15.2";
@@ -129,7 +145,7 @@
       x11-xfce = runVM ./nix/vm/x11-xfce.nix;
     });
 
-    checks = forAllPlatforms (pkgs:
+    checks = forBuildablePlatforms (pkgs:
       import ./nix/tests.nix {
         inherit home-manager nixpkgs self;
         inherit (pkgs.stdenv.hostPlatform) system;
