@@ -1544,6 +1544,7 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
         // The mouse mods only contain binding modifiers since we don't
         // want caps/num lock or sided modifiers to affect the mouse.
         self.mouse.mods = mods.binding();
+        self.mouse.link_point = null;
 
         // We also need to update the renderer so it knows if it should
         // highlight links. Additionally, mark the screen as dirty so
@@ -1577,6 +1578,8 @@ fn mouseRefreshLinks(
     pos_vp: terminal.point.Coordinate,
     over_link: bool,
 ) !void {
+    self.mouse.over_link = false;
+
     // If the position is outside our viewport, do nothing
     if (pos.x < 0 or pos.y < 0) return;
 
@@ -2738,6 +2741,7 @@ pub fn keyCallback(
                 break :mouse_mods;
             };
         } else if (self.io.terminal.flags.mouse_event != .none and !capture_modifier_pressed) {
+            self.mouse.over_link = false;
             // If we have mouse reports on and our capture modifier is not
             // pressed, we reset state.
             _ = try self.rt_app.performAction(
@@ -4042,9 +4046,6 @@ pub fn mouseButtonCallback(
         defer self.queueRender() catch {};
     }
 
-    // Always record our latest mouse state
-    self.mouse.click_state[@intCast(@intFromEnum(button))] = action;
-
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
 
@@ -4060,6 +4061,32 @@ pub fn mouseButtonCallback(
         defer self.renderer_state.mutex.unlock();
 
         const forwarded = self.mouseModifierCapture(false);
+        if (button == .left and action == .press and shouldDetectLinks(
+            self.io.terminal.flags.mouse_event,
+            capture_modifier_pressed,
+            forwarded,
+            self.mouse.mods,
+        )) refresh_links: {
+            // Modifiers may arrive with the click itself (no prior motion
+            // or key event), so refresh link state before choosing the
+            // gesture owner. Failure must not drop the click.
+            const pos = self.rt_surface.getCursorPos() catch |err| {
+                log.warn("failed to get cursor pos for links err={}", .{err});
+                break :refresh_links;
+            };
+            self.mouseRefreshLinks(
+                pos,
+                self.posToViewport(pos.x, pos.y),
+                self.mouse.over_link,
+            ) catch |err| {
+                log.warn("failed to refresh links err={}", .{err});
+            };
+        }
+
+        // Record click state after the link refresh: mouseRefreshLinks
+        // suppresses links while left is held, which would match this press.
+        self.mouse.click_state[@intCast(@intFromEnum(button))] = action;
+
         const current = switch (action) {
             .press => self.mouse.beginGesture(
                 button,
